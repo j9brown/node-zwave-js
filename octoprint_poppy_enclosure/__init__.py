@@ -2,11 +2,11 @@
 from __future__ import absolute_import
 
 import octoprint.plugin
-from flask import make_response, Response
+from flask import request, make_response, Response
 import json
 
-_INPUT_ID_FAN_EXTERNAL_TEMPERATURE = 1
-_OUTPUT_ID_LIGHTS = 2
+_ID_CHAMBER_TEMPERATURE = 1
+_ID_CHAMBER_LIGHTING = 2
 
 class PoppyEnclosureSurrogatePlugin(
     octoprint.plugin.StartupPlugin,
@@ -16,69 +16,92 @@ class PoppyEnclosureSurrogatePlugin(
     def __init__(self):
         self._poppy = {}
 
+    # Get input property.
     def _get_input(self, identifier):
         self._logger.debug("get input %s", identifier)
-        if identifier == _INPUT_ID_FAN_EXTERNAL_TEMPERATURE:
-            if "get_fan_external_temperature" in self._poppy:
+        if identifier == _ID_CHAMBER_TEMPERATURE:
+            if "get_chamber_temperature" in self._poppy:
                 return {
                     "index_id": identifier,
-                    "temp_sensor_temp": self._poppy["get_fan_external_temperature"](),
+                    "temp_sensor_temp": self._poppy["get_chamber_temperature"](),
                     "temp_sensor_humidity": 0,
                     "use_fahrenheit": False
                 }
         return None
 
-    def _set_output(self, identifier, value):
-        self._logger.debug("set output %s, value %s", identifier, value)
-        if identifier == _OUTPUT_ID_LIGHTS:
-            self._logger.info("set lights %s", value)
-            return True
+    # Set an output with a boolean state.
+    def _set_output_state(self, identifier, state):
+        self._logger.debug("set output %s, state %s", identifier, state)
+
+        # Fallback to output with floating-point duty cycle, if any.
+        return self._set_output_level(identifier, float(state))
+
+    # Set an output with a floating-point level between 0.0 and 1.0.
+    def _set_output_level(self, identifier, level):
+        self._logger.debug("set output %s, level %s", identifier, level)
+
+        # No outputs yet, OctoDash v2.2.0 doesn't support sending this action.
         return False
 
-    # ~~ Blueprintplugin mixin
+    # Set an LED with RGB tuple components between 0 and 255.
+    def _set_led_color(self, identifier, color):
+        self._logger.debug("set led %s, color %s", identifier, color)
+        if identifier == _ID_CHAMBER_LIGHTING:
+            if "set_chamber_light_mode" in self._poppy:
+                # Using red channel to set the mode
+                self._poppy["set_chamber_light_mode"](color[0])
+                return True
+        return False
+
+    # ~~ BlueprintPlugin mixin
 
     @octoprint.plugin.BlueprintPlugin.route("/inputs/<int:identifier>", methods=["GET"])
-    def get_input_status(self, identifier):
+    def handle_input_request(self, identifier):
         result = self._get_input(identifier)
         if result:
             return Response(json.dumps(result), mimetype='application/json')
         return make_response('', 404)
 
     @octoprint.plugin.BlueprintPlugin.route("/outputs/<int:identifier>", methods=["PATCH"])
-    def set_output_status(self, identifier):
-        return self._set_output_attrib(identifier, "status")
-
-    @octoprint.plugin.BlueprintPlugin.route("/pwm/<int:identifier>", methods=["PATCH"])
-    def set_output_pwm(self, identifier):
-        return self._set_output_attrib(identifier, "duty_cycle")
-    
-    def _set_output_attrib(self, identifier, attrib):
-        self._logger.info("YYY")
-        if "application/json" not in request.headers["Content-Type"]:
-            return make_response("expected json", 400)
-
-        try:
-            data = request.json
-        except BadRequest:
+    def handle_output_request(self, identifier):
+        state = self._parse_json_request(lambda x: bool(x["status"]))
+        if not state:
             return make_response("malformed request", 400)
-
-        if attrib not in data:
-            return make_response("missing attribute in body", 406)
-
-        value = 0
-        try:
-            value = int(data[attrib])
-        except:
-            return make_response("malformed attribute in body", 406)
-
-        if self._set_output(identifier, value):
+        if self._set_output_state(identifier, state):
             return make_response('', 204)
         return make_response('', 404)
+
+    @octoprint.plugin.BlueprintPlugin.route("/pwm/<int:identifier>", methods=["PATCH"])
+    def handle_pwm_request(self, identifier):
+        level = self._parse_json_request(lambda x: float(x["duty_cycle"]))
+        if not level:
+            return make_response("malformed request", 400)
+        if self._set_output_level(identifier, level):
+            return make_response('', 204)
+        return make_response('', 404)
+
+    @octoprint.plugin.BlueprintPlugin.route("/neopixel/<int:identifier>", methods=["PATCH"])
+    def handle_neopixel_request(self, identifier):
+        color = self._parse_json_request(lambda x: (int(x["red"]), int(x["green"]), int(x["blue"])))
+        if not color:
+            return make_response("malformed request", 400)
+        if self._set_led_color(identifier, color):
+            return make_response('', 204)
+        return make_response('', 404)
+
+    def _parse_json_request(self, fn):
+        if "application/json" not in request.headers["Content-Type"]:
+            return None
+        try:
+            return fn(request.json)
+        except:
+            return None
 
     ##~~ StartupPlugin mixin
 
     def on_startup(self, host, port):
-        helpers = self._plugin_manager.get_helpers("poppy", "get_fan_external_temperature")
+        helpers = self._plugin_manager.get_helpers("poppy",
+                "get_chamber_temperature", "set_chamber_light_mode")
         if helpers:
             self._poppy = helpers
         else:
